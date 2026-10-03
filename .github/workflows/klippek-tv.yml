@@ -6,9 +6,6 @@ on:
     paths:
       - ".github/workflows/klippek-tv.yml"
       - "build_hls.py"
-
-  # Új MP4-ek esetén kézzel indítható.
-  # Ha szeretnéd, később bekapcsolható napi/óránkénti ütemezés.
   schedule:
     - cron: "17 */6 * * *"
 
@@ -23,6 +20,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
 
       - name: Install Python dependencies
         run: |
