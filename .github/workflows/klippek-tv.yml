@@ -1,0 +1,43 @@
+name: KLIPEK TV - HLS Build
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/klippek-tv.yml"
+      - "build_hls.py"
+
+  # Új MP4-ek esetén kézzel indítható.
+  # Ha szeretnéd, később bekapcsolható napi/óránkénti ütemezés.
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  build-hls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install requests
+
+      - name: Check FFmpeg
+        run: |
+          ffmpeg -version
+          ffprobe -version
+
+      - name: Build and upload HLS
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_DATASET: androjid21/klippek
+          HLS_SEGMENT_SECONDS: "6"
+        run: |
+          python3 build_hls.py
