@@ -125,6 +125,120 @@ def list_mp4s():
     return out
 
 
+
+def parse_hls_playlist(text):
+    segments = []
+    pending = None
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+
+        if line.startswith("#EXTINF:"):
+            try:
+                pending = float(line[len("#EXTINF:"):].split(",", 1)[0])
+            except ValueError:
+                pending = None
+            continue
+
+        if line.startswith("#"):
+            continue
+
+        if pending is not None:
+            segments.append((line, pending))
+            pending = None
+
+    return segments
+
+
+def remote_clip_item(source, repo_files):
+    key = slug(source)
+    index_remote = ROOT.as_posix() + "/" + key + "/index.m3u8"
+
+    # The per-clip index is uploaded only after all segment uploads
+    # and therefore acts as the completion marker.
+    if index_remote not in repo_files:
+        return None
+
+    url = (
+        BASE_RESOLVE
+        + "/".join(quote(x, safe="") for x in index_remote.split("/"))
+        + "?download=true"
+    )
+
+    r = requests.get(url, headers=HEADERS, timeout=60)
+
+    if r.status_code == 404:
+        return None
+
+    r.raise_for_status()
+
+    refs = parse_hls_playlist(r.text)
+
+    if not refs:
+        return None
+
+    prefix = ROOT.as_posix() + "/" + key + "/"
+
+    for filename, _duration in refs:
+        if prefix + filename not in repo_files:
+            return None
+
+    return {
+        "source": source,
+        "title": Path(source).stem,
+        "duration": round(sum(duration for _filename, duration in refs), 3),
+        "segments": [
+            {
+                "duration": round(duration, 3),
+                "path": prefix + filename,
+            }
+            for filename, duration in refs
+        ],
+    }
+
+
+def list_repo_files():
+    out = set()
+    cursor = None
+
+    for _ in range(200):
+        params = {
+            "recursive": "true",
+            "expand": "false",
+            "limit": "1000",
+        }
+
+        if cursor:
+            params["cursor"] = cursor
+
+        r = requests.get(
+            API,
+            params=params,
+            headers=HEADERS,
+            timeout=90,
+        )
+
+        r.raise_for_status()
+
+        data = r.json()
+        items = data.get("items", []) if isinstance(data, dict) else data
+
+        for item in items:
+            if item.get("type") == "file" and item.get("path"):
+                out.add(item["path"])
+
+        link = r.headers.get("Link", "")
+        m = re.search(r"[?&]cursor=([^>&, ]+)", link)
+
+        if not m or len(items) < 1000:
+            break
+
+        cursor = m.group(1)
+
+    return out
+
 def download(path, target):
     url = (
         BASE_RESOLVE
@@ -219,6 +333,9 @@ def build_one(source, work, output_root):
     key = slug(source)
 
     outdir = output_root / key
+
+    if outdir.exists():
+        shutil.rmtree(outdir, ignore_errors=True)
 
     outdir.mkdir(
         parents=True,
@@ -342,40 +459,34 @@ def build_one(source, work, output_root):
         str(playlist),
     ])
 
-    segments = []
+    # IMPORTANT:
+    # Do NOT ffprobe every .ts segment. The old version did this and
+    # one malformed/awkward segment could kill a 3-hour build.
+    # FFmpeg already wrote the authoritative EXTINF durations into
+    # index.m3u8, so use those values directly.
+    playlist_text = playlist.read_text(
+        encoding="utf-8",
+        errors="replace",
+    )
 
-    for seg in sorted(
-        outdir.glob("seg_*.ts")
-    ):
+    refs = parse_hls_playlist(playlist_text)
 
-        d = run([
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(seg),
-        ])
-
-        sd = float(
-            d.stdout.strip()
+    if not refs:
+        raise RuntimeError(
+            "Az FFmpeg nem készített értelmezhető HLS playlistet."
         )
 
-        segments.append({
-            "duration": round(sd, 3),
+    segments = [
+        {
+            "duration": round(duration, 3),
             "path": (
                 f"{ROOT.as_posix()}/"
                 f"{key}/"
-                f"{seg.name}"
+                f"{filename}"
             ),
-        })
-
-    if not segments:
-        raise RuntimeError(
-            "Az FFmpeg nem készített HLS szegmenseket."
-        )
+        }
+        for filename, duration in refs
+    ]
 
     # Upload segments first, then playlist.
     for seg in sorted(
@@ -436,15 +547,44 @@ def main():
 
         work = Path(td)
 
+        # Build a remote inventory once. This makes the job resumable:
+        # an existing per-clip index.m3u8 means that clip is already done.
+        print("Remote HLS fájllista ellenőrzése...", flush=True)
+        repo_files = list_repo_files()
+
         manifest_clips = []
+        pending = []
 
         for n, source in enumerate(
             sources,
             1,
         ):
+            existing = remote_clip_item(
+                source,
+                repo_files,
+            )
+
+            if existing:
+                manifest_clips.append(existing)
+
+                print(
+                    f"[{n}/{len(sources)}] KÉSZ -> SKIP: {source}",
+                    flush=True,
+                )
+            else:
+                pending.append((n, source))
+
+        print(
+            f"\nMár kész: {len(manifest_clips)} | "
+            f"Feldolgozandó: {len(pending)}",
+            flush=True,
+        )
+
+        for n, source in pending:
 
             print(
-                f"\n[{n}/{len(sources)}] {source}"
+                f"\n[{n}/{len(sources)}] BUILD: {source}",
+                flush=True,
             )
 
             try:
@@ -463,6 +603,7 @@ def main():
                 print(
                     f"SKIP: {source}: {e}",
                     file=sys.stderr,
+                    flush=True,
                 )
 
         if not manifest_clips:
