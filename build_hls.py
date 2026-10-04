@@ -31,11 +31,17 @@ from pathlib import Path
 from urllib.parse import quote
 
 import requests
+
+# Disable the Xet upload path because it can produce an empty Bearer
+# header in GitHub Actions. We use the regular Hub commit client.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 from huggingface_hub import HfApi, CommitOperationAdd
 
 
 DATASET = os.environ.get("HF_DATASET", "androjid21/klippek")
-HF_TOKEN = os.environ["HF_TOKEN"]
+HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
+if not HF_TOKEN:
+    raise SystemExit("HF_TOKEN hiányzik vagy üres. A GitHub Actions Secrets/Variables alatt állítsd be a HF_TOKEN secretet.")
 BRANCH = os.environ.get("HF_BRANCH", "main")
 ROOT = Path(os.environ.get("HLS_ROOT", "hls"))
 SEGMENT_SECONDS = int(os.environ.get("HLS_SEGMENT_SECONDS", "6"))
@@ -49,7 +55,8 @@ HEADERS = {
     "User-Agent": "klippek-tv-fast-remux/2.0",
 }
 
-HF = HfApi(token=HF_TOKEN)
+# A commit kliens minden uploadnál frissen jön létre.
+HF = None
 
 
 def run(cmd):
@@ -231,12 +238,19 @@ def commit_files(files, message):
         for local, remote in files
     ]
 
-    HF.create_commit(
+    token = os.environ.get("HF_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("HF_TOKEN üres az upload pillanatában.")
+
+    # Friss kliens + explicit token minden commitnél.
+    client = HfApi(token=token)
+    client.create_commit(
         repo_id=DATASET,
         repo_type="dataset",
         revision=BRANCH,
         operations=operations,
         commit_message=message,
+        token=token,
     )
 
 
