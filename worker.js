@@ -365,6 +365,29 @@ export default {
       }
     }
 
+    if (url.pathname === "/api/now") {
+      try {
+        const manifest = await getManifest(false);
+        const nowSeconds = Date.now() / 1000;
+        const located = locateTime(manifest, nowSeconds);
+        const clip = manifest.clips[located.clipIndex];
+
+        return json({
+          ok: true,
+          channel: "KLIPEK TV",
+          title: clip?.title || clip?.source || "KLIPEK TV",
+          source: clip?.source || null,
+          clipIndex: located.clipIndex,
+          offsetSeconds: Math.floor(located.offset),
+          durationSeconds: Math.round(clipDuration(clip)),
+          playlist: "/live.m3u8",
+          updatedAt: manifest.generatedAt || null,
+        });
+      } catch (e) {
+        return json({ ok:false, error:e.message }, 502);
+      }
+    }
+
     if (url.pathname === "/api/status") {
       try {
         const manifest = await getManifest(false);
