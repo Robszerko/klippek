@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
 """
-KLIPEK TV HLS builder.
+KLIPEK TV — FAST HLS REMUX BUILDER
 
-Reads MP4 files from the public Hugging Face dataset:
-    androjid21/klippek
+Source:
+  androjid21/klippek
 
-For each MP4:
-  - downloads it
-  - uses ffprobe to inspect duration
-  - converts it to H.264/AAC MPEG-TS HLS segments
-  - creates a compact manifest.json
-  - uploads generated HLS assets to a separate hls/ directory
-    in the same Hugging Face dataset.
+Important:
+  This version does NOT re-encode the MP4 files.
+  FFmpeg uses -c copy and only repackages compatible streams
+  into MPEG-TS HLS segments.
 
-The Worker consumes hls/manifest.json and generates a synchronized
-live HLS playlist.
+The per-clip index.m3u8 is uploaded last and acts as the
+completion marker, so interrupted runs can resume.
 
-Environment:
-  HF_TOKEN - Hugging Face write token
-  HF_DATASET - optional, defaults to androjid21/klippek
+Only H.264 video + AAC audio are accepted by the fast path.
+Clips using another codec are reported as SKIP instead of
+being silently re-encoded.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -33,6 +31,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import requests
+from huggingface_hub import HfApi, CommitOperationAdd
 
 
 DATASET = os.environ.get("HF_DATASET", "androjid21/klippek")
@@ -42,40 +41,46 @@ ROOT = Path(os.environ.get("HLS_ROOT", "hls"))
 SEGMENT_SECONDS = int(os.environ.get("HLS_SEGMENT_SECONDS", "6"))
 MAX_FILES = int(os.environ.get("MAX_FILES", "0"))
 
-
 API = f"https://huggingface.co/api/datasets/{DATASET}/tree/{BRANCH}"
 BASE_RESOLVE = f"https://huggingface.co/datasets/{DATASET}/resolve/{BRANCH}/"
 
-
 HEADERS = {
     "Authorization": f"Bearer {HF_TOKEN}",
-    "User-Agent": "klippek-tv-hls-builder/1.0",
+    "User-Agent": "klippek-tv-fast-remux/2.0",
 }
 
+HF = HfApi(token=HF_TOKEN)
 
-def run(cmd, check=True):
+
+def run(cmd):
     print("+", " ".join(map(str, cmd)), flush=True)
-
     return subprocess.run(
         cmd,
-        check=check,
+        check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
 
 
-def list_mp4s():
-    out = []
+def encode_path(path):
+    return "/".join(quote(x, safe="") for x in path.split("/"))
+
+
+def resolve_url(path):
+    return BASE_RESOLVE + encode_path(path) + "?download=true"
+
+
+def list_repo_files():
+    files = set()
     cursor = None
 
-    for _ in range(100):
+    for _ in range(300):
         params = {
             "recursive": "true",
             "expand": "false",
             "limit": "1000",
         }
-
         if cursor:
             params["cursor"] = cursor
 
@@ -83,61 +88,41 @@ def list_mp4s():
             API,
             params=params,
             headers=HEADERS,
-            timeout=60,
+            timeout=90,
         )
-
         r.raise_for_status()
 
         data = r.json()
-
-        if isinstance(data, dict):
-            items = data.get("items", [])
-        else:
-            items = data
+        items = data.get("items", []) if isinstance(data, dict) else data
 
         for item in items:
-            if item.get("type") == "file":
-                path = item.get("path", "")
-
-                if (
-                    path.lower().endswith(".mp4")
-                    and not path.startswith("hls/")
-                ):
-                    out.append(path)
+            if item.get("type") == "file" and item.get("path"):
+                files.add(item["path"])
 
         link = r.headers.get("Link", "")
-
-        m = re.search(
-            r"[?&]cursor=([^>&, ]+)",
-            link,
-        )
+        m = re.search(r"[?&]cursor=([^>&, ]+)", link)
 
         if not m or len(items) < 1000:
             break
 
         cursor = m.group(1)
 
-    out = sorted(set(out))
-
-    if MAX_FILES:
-        out = out[:MAX_FILES]
-
-    return out
-
+    return files
 
 
 def parse_hls_playlist(text):
-    segments = []
+    result = []
     pending = None
 
     for raw in text.splitlines():
         line = raw.strip()
+
         if not line:
             continue
 
         if line.startswith("#EXTINF:"):
             try:
-                pending = float(line[len("#EXTINF:"):].split(",", 1)[0])
+                pending = float(line.split(":", 1)[1].split(",", 1)[0])
             except ValueError:
                 pending = None
             continue
@@ -146,28 +131,128 @@ def parse_hls_playlist(text):
             continue
 
         if pending is not None:
-            segments.append((line, pending))
+            result.append((line, pending))
             pending = None
 
-    return segments
+    return result
+
+
+def slug(path):
+    name = re.sub(
+        r"[^A-Za-z0-9._-]+",
+        "_",
+        Path(path).stem,
+    )
+    digest = hashlib.sha1(path.encode("utf-8")).hexdigest()[:12]
+    return f"{name}_{digest}"
+
+
+def list_mp4s(repo_files):
+    result = sorted(
+        p for p in repo_files
+        if p.lower().endswith(".mp4")
+        and not p.startswith("hls/")
+    )
+
+    if MAX_FILES:
+        result = result[:MAX_FILES]
+
+    return result
+
+
+def download(source, target):
+    print(f"Downloading: {source}", flush=True)
+
+    with requests.get(
+        resolve_url(source),
+        headers=HEADERS,
+        stream=True,
+        timeout=180,
+    ) as r:
+        r.raise_for_status()
+
+        with open(target, "wb") as f:
+            for chunk in r.iter_content(1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+
+def probe(path):
+    p = run([
+        "ffprobe",
+        "-v", "error",
+        "-show_entries",
+        "format=duration:stream=codec_type,codec_name",
+        "-of", "json",
+        str(path),
+    ])
+
+    data = json.loads(p.stdout)
+
+    video = next(
+        (
+            s for s in data.get("streams", [])
+            if s.get("codec_type") == "video"
+        ),
+        None,
+    )
+
+    audio = next(
+        (
+            s for s in data.get("streams", [])
+            if s.get("codec_type") == "audio"
+        ),
+        None,
+    )
+
+    if not video:
+        raise RuntimeError("Nincs video stream.")
+
+    duration = float(
+        data.get("format", {}).get("duration") or 0
+    )
+
+    if duration <= 0:
+        raise RuntimeError("Érvénytelen videóidőtartam.")
+
+    return {
+        "duration": duration,
+        "video": video.get("codec_name", ""),
+        "audio": audio.get("codec_name", "") if audio else "",
+    }
+
+
+def commit_files(files, message):
+    operations = [
+        CommitOperationAdd(
+            path_in_repo=remote,
+            path_or_fileobj=str(local),
+        )
+        for local, remote in files
+    ]
+
+    HF.create_commit(
+        repo_id=DATASET,
+        repo_type="dataset",
+        revision=BRANCH,
+        operations=operations,
+        commit_message=message,
+    )
 
 
 def remote_clip_item(source, repo_files):
     key = slug(source)
-    index_remote = ROOT.as_posix() + "/" + key + "/index.m3u8"
+    prefix = f"{ROOT.as_posix()}/{key}/"
+    index_remote = prefix + "index.m3u8"
 
-    # The per-clip index is uploaded only after all segment uploads
-    # and therefore acts as the completion marker.
     if index_remote not in repo_files:
         return None
 
-    url = (
-        BASE_RESOLVE
-        + "/".join(quote(x, safe="") for x in index_remote.split("/"))
-        + "?download=true"
+    r = requests.get(
+        resolve_url(index_remote),
+        headers=HEADERS,
+        timeout=60,
     )
-
-    r = requests.get(url, headers=HEADERS, timeout=60)
 
     if r.status_code == 404:
         return None
@@ -179,8 +264,6 @@ def remote_clip_item(source, repo_files):
     if not refs:
         return None
 
-    prefix = ROOT.as_posix() + "/" + key + "/"
-
     for filename, _duration in refs:
         if prefix + filename not in repo_files:
             return None
@@ -188,402 +271,185 @@ def remote_clip_item(source, repo_files):
     return {
         "source": source,
         "title": Path(source).stem,
-        "duration": round(sum(duration for _filename, duration in refs), 3),
+        "duration": round(sum(d for _, d in refs), 3),
         "segments": [
             {
-                "duration": round(duration, 3),
+                "duration": round(d, 3),
                 "path": prefix + filename,
             }
-            for filename, duration in refs
+            for filename, d in refs
         ],
     }
 
 
-def list_repo_files():
-    out = set()
-    cursor = None
-
-    for _ in range(200):
-        params = {
-            "recursive": "true",
-            "expand": "false",
-            "limit": "1000",
-        }
-
-        if cursor:
-            params["cursor"] = cursor
-
-        r = requests.get(
-            API,
-            params=params,
-            headers=HEADERS,
-            timeout=90,
-        )
-
-        r.raise_for_status()
-
-        data = r.json()
-        items = data.get("items", []) if isinstance(data, dict) else data
-
-        for item in items:
-            if item.get("type") == "file" and item.get("path"):
-                out.add(item["path"])
-
-        link = r.headers.get("Link", "")
-        m = re.search(r"[?&]cursor=([^>&, ]+)", link)
-
-        if not m or len(items) < 1000:
-            break
-
-        cursor = m.group(1)
-
-    return out
-
-def download(path, target):
-    url = (
-        BASE_RESOLVE
-        + "/".join(
-            quote(x, safe="")
-            for x in path.split("/")
-        )
-        + "?download=true"
-    )
-
-    print(f"Downloading: {path}")
-
-    with requests.get(
-        url,
-        headers=HEADERS,
-        stream=True,
-        timeout=120,
-    ) as r:
-
-        r.raise_for_status()
-
-        with open(target, "wb") as f:
-            for chunk in r.iter_content(1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-
-
-def ffprobe_duration(path):
-    p = run([
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        str(path),
-    ])
-
-    return float(p.stdout.strip())
-
-
-def slug(path):
-    name = Path(path).stem
-
-    name = re.sub(
-        r"[^A-Za-z0-9._-]+",
-        "_",
-        name,
-    )
-
-    # Include a stable hash-like path component so files
-    # with identical names in different folders do not collide.
-    import hashlib
-
-    h = hashlib.sha1(
-        path.encode("utf-8")
-    ).hexdigest()[:12]
-
-    return f"{name}_{h}"
-
-
-def upload_file(local, remote):
-    # Hugging Face Hub dataset upload endpoint.
-    url = (
-        f"https://huggingface.co/api/datasets/"
-        f"{DATASET}/upload/{BRANCH}/"
-        f"{quote(remote, safe='/')}"
-    )
-
-    print(f"Uploading: {remote}")
-
-    with open(local, "rb") as f:
-        r = requests.put(
-            url,
-            headers={
-                **HEADERS,
-                "Content-Type": "application/octet-stream",
-            },
-            data=f,
-            timeout=600,
-        )
-
-    if r.status_code >= 300:
-        raise RuntimeError(
-            f"Upload failed {r.status_code}: "
-            f"{r.text[:1000]}"
-        )
-
-
 def build_one(source, work, output_root):
     key = slug(source)
-
     outdir = output_root / key
 
     if outdir.exists():
         shutil.rmtree(outdir, ignore_errors=True)
 
-    outdir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    # FIX:
-    # The temporary work directory must exist before
-    # input.mp4 is downloaded into it.
-    work.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    outdir.mkdir(parents=True, exist_ok=True)
+    work.mkdir(parents=True, exist_ok=True)
 
     mp4 = work / "input.mp4"
+    download(source, mp4)
 
-    download(
-        source,
-        mp4,
+    if not mp4.exists() or mp4.stat().st_size == 0:
+        raise RuntimeError("A letöltött MP4 hiányzik vagy üres.")
+
+    media = probe(mp4)
+
+    print(
+        f"  FAST REMUX | video={media['video']} "
+        f"audio={media['audio'] or 'nincs'} "
+        f"duration={media['duration']:.1f}s",
+        flush=True,
     )
 
-    if not mp4.exists():
+    if media["video"] != "h264":
         raise RuntimeError(
-            f"Download után nem található az input fájl: {mp4}"
+            f"Nem H.264 video ({media['video']}); "
+            "nem transzkódoljuk, ezért SKIP."
         )
 
-    if mp4.stat().st_size == 0:
+    if media["audio"] not in ("aac", ""):
         raise RuntimeError(
-            f"A letöltött MP4 üres: {mp4}"
+            f"Nem AAC audio ({media['audio']}); "
+            "nem transzkódoljuk, ezért SKIP."
         )
-
-    duration = ffprobe_duration(mp4)
 
     playlist = outdir / "index.m3u8"
 
-    # Fixed GOP and normalized audio/video make the individual
-    # HLS segments compatible when the Worker places multiple
-    # clips into one live playlist.
     run([
         "ffmpeg",
         "-hide_banner",
         "-y",
-
-        "-i",
-        str(mp4),
-
-        "-map",
-        "0:v:0",
-
-        "-map",
-        "0:a:0?",
-
-        "-vf",
-        r"scale=w=min(1280\,iw):h=-2:force_original_aspect_ratio=decrease",
-
-        "-c:v",
-        "libx264",
-
-        "-preset",
-        "veryfast",
-
-        "-profile:v",
-        "main",
-
-        "-pix_fmt",
-        "yuv420p",
-
-        "-b:v",
-        "2500k",
-
-        "-maxrate",
-        "2800k",
-
-        "-bufsize",
-        "5000k",
-
-        "-r",
-        "30",
-
-        "-g",
-        str(SEGMENT_SECONDS * 30),
-
-        "-keyint_min",
-        str(SEGMENT_SECONDS * 30),
-
-        "-sc_threshold",
-        "0",
-
-        "-c:a",
-        "aac",
-
-        "-b:a",
-        "128k",
-
-        "-ar",
-        "48000",
-
-        "-ac",
-        "2",
-
-        "-f",
-        "hls",
-
-        "-hls_time",
-        str(SEGMENT_SECONDS),
-
-        "-hls_playlist_type",
-        "vod",
-
-        "-hls_segment_type",
-        "mpegts",
-
-        "-hls_flags",
-        "independent_segments",
-
+        "-i", str(mp4),
+        "-map", "0:v:0",
+        "-map", "0:a:0?",
+        "-c:v", "copy",
+        "-c:a", "copy",
+        "-f", "hls",
+        "-hls_time", str(SEGMENT_SECONDS),
+        "-hls_playlist_type", "vod",
+        "-hls_segment_type", "mpegts",
+        "-hls_flags", "independent_segments",
         "-hls_segment_filename",
-        str(
-            outdir / "seg_%05d.ts"
-        ),
-
+        str(outdir / "seg_%05d.ts"),
         str(playlist),
     ])
 
-    # IMPORTANT:
-    # Do NOT ffprobe every .ts segment. The old version did this and
-    # one malformed/awkward segment could kill a 3-hour build.
-    # FFmpeg already wrote the authoritative EXTINF durations into
-    # index.m3u8, so use those values directly.
-    playlist_text = playlist.read_text(
-        encoding="utf-8",
-        errors="replace",
+    refs = parse_hls_playlist(
+        playlist.read_text(
+            encoding="utf-8",
+            errors="replace",
+        )
     )
 
-    refs = parse_hls_playlist(playlist_text)
-
     if not refs:
-        raise RuntimeError(
-            "Az FFmpeg nem készített értelmezhető HLS playlistet."
-        )
+        raise RuntimeError("Nem készült HLS playlist.")
 
-    segments = [
-        {
-            "duration": round(duration, 3),
-            "path": (
-                f"{ROOT.as_posix()}/"
-                f"{key}/"
-                f"{filename}"
-            ),
-        }
-        for filename, duration in refs
+    local = {
+        p.name: p
+        for p in outdir.glob("seg_*.ts")
+    }
+
+    missing = [
+        filename
+        for filename, _duration in refs
+        if filename not in local
     ]
 
-    # Upload segments first, then playlist.
-    for seg in sorted(
-        outdir.glob("seg_*.ts")
-    ):
-        upload_file(
-            seg,
-            (
-                f"{ROOT.as_posix()}/"
-                f"{key}/"
-                f"{seg.name}"
-            ),
+    if missing:
+        raise RuntimeError(
+            f"Hiányzó szegmens: {missing[:5]}"
         )
 
-    # Upload the per-clip playlist too.
-    upload_file(
-        playlist,
+    upload_files = [
         (
-            f"{ROOT.as_posix()}/"
-            f"{key}/index.m3u8"
-        ),
+            local[filename],
+            f"{ROOT.as_posix()}/{key}/{filename}",
+        )
+        for filename, _duration in refs
+    ]
+
+    print(
+        f"  Feltöltés: {len(upload_files)} szegmens + playlist",
+        flush=True,
+    )
+
+    # One HF commit per clip, not one commit per segment.
+    commit_files(
+        upload_files + [
+            (
+                playlist,
+                f"{ROOT.as_posix()}/{key}/index.m3u8",
+            )
+        ],
+        f"KLIPEK TV: remux {Path(source).stem}",
     )
 
     return {
         "source": source,
         "title": Path(source).stem,
-        "duration": round(
-            duration,
-            3,
-        ),
-        "segments": segments,
+        "duration": round(sum(d for _, d in refs), 3),
+        "segments": [
+            {
+                "duration": round(d, 3),
+                "path": f"{ROOT.as_posix()}/{key}/{filename}",
+            }
+            for filename, d in refs
+        ],
     }
 
 
 def main():
-    if (
-        shutil.which("ffmpeg") is None
-        or shutil.which("ffprobe") is None
-    ):
-        raise SystemExit(
-            "ffmpeg/ffprobe hiányzik."
-        )
+    if not shutil.which("ffmpeg"):
+        raise SystemExit("ffmpeg hiányzik.")
 
-    sources = list_mp4s()
+    if not shutil.which("ffprobe"):
+        raise SystemExit("ffprobe hiányzik.")
 
-    print(
-        f"Talált MP4-ek: {len(sources)}"
-    )
+    print("Remote fájllista ellenőrzése...", flush=True)
+    repo_files = list_repo_files()
+
+    sources = list_mp4s(repo_files)
+
+    print(f"Talált MP4-ek: {len(sources)}", flush=True)
 
     if not sources:
-        raise SystemExit(
-            "Nem találtam MP4 fájlt."
-        )
+        raise SystemExit("Nem találtam MP4 fájlt.")
+
+    manifest_clips = []
+    pending = []
+
+    for n, source in enumerate(sources, 1):
+        existing = remote_clip_item(source, repo_files)
+
+        if existing:
+            manifest_clips.append(existing)
+            print(
+                f"[{n}/{len(sources)}] KÉSZ -> SKIP: {source}",
+                flush=True,
+            )
+        else:
+            pending.append((n, source))
+
+    print(
+        f"\nMár kész: {len(manifest_clips)} | "
+        f"FAST REMUX: {len(pending)}",
+        flush=True,
+    )
 
     with tempfile.TemporaryDirectory(
-        prefix="klippek-tv-"
+        prefix="klippek-tv-fast-"
     ) as td:
-
         work = Path(td)
 
-        # Build a remote inventory once. This makes the job resumable:
-        # an existing per-clip index.m3u8 means that clip is already done.
-        print("Remote HLS fájllista ellenőrzése...", flush=True)
-        repo_files = list_repo_files()
-
-        manifest_clips = []
-        pending = []
-
-        for n, source in enumerate(
-            sources,
-            1,
-        ):
-            existing = remote_clip_item(
-                source,
-                repo_files,
-            )
-
-            if existing:
-                manifest_clips.append(existing)
-
-                print(
-                    f"[{n}/{len(sources)}] KÉSZ -> SKIP: {source}",
-                    flush=True,
-                )
-            else:
-                pending.append((n, source))
-
-        print(
-            f"\nMár kész: {len(manifest_clips)} | "
-            f"Feldolgozandó: {len(pending)}",
-            flush=True,
-        )
-
         for n, source in pending:
-
             print(
-                f"\n[{n}/{len(sources)}] BUILD: {source}",
+                f"\n[{n}/{len(sources)}] FAST REMUX: {source}",
                 flush=True,
             )
 
@@ -593,13 +459,9 @@ def main():
                     work / f"clip_{n}",
                     ROOT,
                 )
-
-                manifest_clips.append(
-                    item
-                )
+                manifest_clips.append(item)
 
             except Exception as e:
-
                 print(
                     f"SKIP: {source}: {e}",
                     file=sys.stderr,
@@ -612,23 +474,17 @@ def main():
             )
 
         manifest = {
-            "version": 1,
-
+            "version": 2,
+            "mode": "fast-remux",
             "generatedAt": time.strftime(
                 "%Y-%m-%dT%H:%M:%SZ",
                 time.gmtime(),
             ),
-
-            "segmentSeconds":
-                SEGMENT_SECONDS,
-
-            "clips":
-                manifest_clips,
+            "segmentSeconds": SEGMENT_SECONDS,
+            "clips": manifest_clips,
         }
 
-        manifest_path = (
-            work / "manifest.json"
-        )
+        manifest_path = work / "manifest.json"
 
         manifest_path.write_text(
             json.dumps(
@@ -639,28 +495,23 @@ def main():
             encoding="utf-8",
         )
 
-        upload_file(
-            manifest_path,
-            f"{ROOT.as_posix()}/manifest.json",
+        commit_files(
+            [
+                (
+                    manifest_path,
+                    f"{ROOT.as_posix()}/manifest.json",
+                )
+            ],
+            "KLIPEK TV: update fast-remux manifest",
         )
 
-        print("\n================================")
-        print("KÉSZ")
-        print(
-            "Clips:",
-            len(manifest_clips),
-        )
-        print(
-            "Total seconds:",
-            round(
-                sum(
-                    x["duration"]
-                    for x in manifest_clips
-                ),
-                2,
-            ),
-        )
-        print("================================")
+    total = sum(x["duration"] for x in manifest_clips)
+
+    print("\n================================", flush=True)
+    print("KLIPEK TV FAST REMUX KÉSZ", flush=True)
+    print(f"Clips: {len(manifest_clips)}", flush=True)
+    print(f"Total hours: {total / 3600:.2f}", flush=True)
+    print("================================", flush=True)
 
 
 if __name__ == "__main__":
